@@ -3200,6 +3200,23 @@ or
       </p>
 
       <p>
+        For <code>drop</code> and <code>reject</code> ACLs on a logical
+        switch with stateful ACLs this is also used for sampling all traffic
+        matched by the ACL, regardless of its connection tracking state.
+        Untracked traffic (e.g., traffic entering the logical switch from a
+        router port) and traffic that belongs to sessions established before
+        the ACL was added are denied, and therefore sampled, too.
+      </p>
+
+      <p>
+        For <code>pass</code> ACLs this is used for sampling traffic creating
+        new sessions, once, in the tier of the <code>pass</code> ACL.  The
+        observation data of the <code>pass</code> ACL is not carried over to
+        the next tier: the ACL that eventually determines the verdict is
+        sampled according to its own configuration.
+      </p>
+
+      <p>
         Note: if an ACL has both sampling enabled and a label associated to it
         then the label value overrides the observation point ID defined in the
         <code>sample_new</code> configuration.
@@ -3209,7 +3226,12 @@ or
     <column name="sample_est">
       <p>
         The entry in the <ref table="Sample"/> table to use for sampling for
-        established/related sessions matched by this ACL.
+        established/related sessions matched by this ACL.  Only
+        <code>allow-related</code> ACLs sample established/related sessions:
+        <code>drop</code> and <code>reject</code> ACLs sample all denied
+        traffic with <ref column="sample_new"/> and only store the
+        observation point ID of this entry in the connection tracking label
+        of the blocked session.
       </p>
 
       <p>

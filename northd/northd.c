@@ -7640,6 +7640,19 @@ build_acl_sample_label_action(struct ds *actions, const struct nbrec_acl *acl,
                   (uint8_t) obs_stage);
 }
 
+/* This builds the ACL action that clears the observation point and collector
+ * registers populated by build_acl_sample_label_action().
+ */
+static void
+build_acl_sample_label_clear_action(struct ds *actions)
+{
+    ds_put_cstr(actions, REGBIT_ACL_LABEL" = 0; "
+                         REG_OBS_POINT_ID_NEW " = 0; "
+                         REG_OBS_POINT_ID_EST " = 0; "
+                         REG_OBS_COLLECTOR_ID_NEW " = 0; "
+                         REG_OBS_COLLECTOR_ID_EST " = 0; ");
+}
+
 /* This builds an ACL logical flow specific match that selects traffic
  * with an associated observation point ID register equal to that of the
  * ACL label (if configured) or sample->metadata.
@@ -7924,6 +7937,42 @@ acl_use_generic_sample_flows(const struct nbrec_sample *sample,
     return sample && sample->n_collectors == 1 && features->sample_with_reg;
 }
 
+/* This builds a logical flow that samples traffic dropped or rejected by a
+ * stateful-switch ACL that has sampling enabled.  Unlike allowed traffic,
+ * a drop/reject verdict applies to every packet that matches the ACL,
+ * regardless of its connection tracking state: untracked packets and
+ * packets of previously established connections are denied too.  Sample
+ * all of them. */
+static void
+build_acl_sample_drop_flows(const struct ovn_datapath *od,
+                            struct lflow_table *lflows,
+                            const struct ovn_stage *stage,
+                            enum acl_observation_stage obs_stage,
+                            struct ds *match, struct ds *actions,
+                            const struct nbrec_acl *acl,
+                            uint8_t sample_domain_id,
+                            struct lflow_ref *lflow_ref)
+{
+    ds_clear(match);
+    ds_clear(actions);
+
+    ds_put_cstr(match, "ip && "REGBIT_ACL_LABEL" == 1 && ("
+                       REGBIT_ACL_VERDICT_DROP" == 1 || "
+                       REGBIT_ACL_VERDICT_REJECT" == 1) && ");
+    build_acl_sample_register_match(match, acl, acl->sample_new);
+    /* Only consider observation data recorded by this ACL stage.  Data
+     * recorded by other stages (e.g., by a from-lport ACL when evaluating
+     * to-lport ACLs) must not be attributed to this verdict. */
+    ds_put_format(match, " && "REGBIT_ACL_OBS_STAGE" == %"PRIu8,
+                  (uint8_t) obs_stage);
+    build_acl_sample_action(actions, acl, acl->sample_new, sample_domain_id);
+
+    /* The current deny verdict takes precedence over the established
+     * connection samplers (priority 1200 and lower). */
+    ovn_lflow_add(lflows, od, stage, 1300, ds_cstr(match), ds_cstr(actions),
+                  lflow_ref, WITH_HINT(&acl->header_));
+}
+
 /* This builds all ACL sampling related logical flows:
  * - for packets creating new connections
  * - for packets that are part of an existing connection
@@ -7976,6 +8025,14 @@ build_acl_sample_flows(const struct ls_stateful_record *ls_stateful_rec,
                                                        SAMPLING_APP_ACL_NEW);
     uint8_t sample_est_domain_id = sampling_app_get_id(sampling_apps,
                                                        SAMPLING_APP_ACL_EST);
+
+    if (ls_stateful_rec->has_stateful_acl && acl->sample_new
+        && (!strcmp(acl->action, "drop") || !strcmp(acl->action, "reject"))) {
+        build_acl_sample_drop_flows(od, lflows, stage, obs_stage, match,
+                                    actions, acl, sample_new_domain_id,
+                                    lflow_ref);
+        return;
+    }
 
     if (acl_use_generic_sample_flows(acl->sample_new, features)) {
         build_acl_sample_generic_new_flows(od, lflows, stage, obs_stage,
@@ -8372,6 +8429,12 @@ build_acl_action_lflows(const struct ls_stateful_record *ls_stateful_rec,
         ls_stateful_rec->max_acl_tier.egress,
     };
 
+    enum acl_observation_stage obs_stages[] = {
+        ACL_OBS_FROM_LPORT,
+        ACL_OBS_FROM_LPORT_AFTER_LB,
+        ACL_OBS_TO_LPORT,
+    };
+
     ds_clear(actions);
     ds_put_cstr(actions, REGBIT_ACL_VERDICT_ALLOW " = 0; "
                         REGBIT_ACL_VERDICT_DROP " = 0; "
@@ -8424,6 +8487,25 @@ build_acl_action_lflows(const struct ls_stateful_record *ls_stateful_rec,
                           j + 1, ingress ? "ingress" : "egress",
                           ovn_stage_get_table(eval_stages[i]));
             ovn_lflow_add(lflows, od, stage, 500, ds_cstr(match),
+                         ds_cstr(&tier_actions), lflow_ref);
+
+            /* A "pass" ACL with sampling enabled records its observation
+             * point in registers and gets sampled in the sample stage of
+             * its own tier.  Clear that observation data before moving to
+             * the next tier so that it is not attributed to the verdict of
+             * an ACL in a later tier.  Observation data recorded by another
+             * ACL stage (e.g., by from-lport ACLs while evaluating to-lport
+             * ACLs) is left untouched. */
+            ds_put_format(match, " && "REGBIT_ACL_LABEL" == 1 && "
+                          REGBIT_ACL_OBS_STAGE" == %"PRIu8,
+                          (uint8_t) obs_stages[i]);
+            ds_clear(&tier_actions);
+            build_acl_sample_label_clear_action(&tier_actions);
+            ds_put_format(&tier_actions, REG_ACL_TIER " = %"PRIuSIZE"; "
+                          "next(pipeline=%s,table=%d);",
+                          j + 1, ingress ? "ingress" : "egress",
+                          ovn_stage_get_table(eval_stages[i]));
+            ovn_lflow_add(lflows, od, stage, 550, ds_cstr(match),
                          ds_cstr(&tier_actions), lflow_ref);
         }
         ds_destroy(&tier_actions);
